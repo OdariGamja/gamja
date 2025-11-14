@@ -1,0 +1,295 @@
+// =============================================================
+// simplified_server.c (기능 동일, 구조 단순화 버전)
+// =============================================================
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include <math.h>
+#include "game.h"
+
+#define PORT 5000
+#define MAX_CLIENT 4
+#define TICK_MS 33
+
+// 네트워크용 최소 데이터
+typedef struct { float x, y; } NetPos;
+
+// 클라이언트 소켓 & 연결 여부
+int csock[MAX_CLIENT];
+int alive[MAX_CLIENT];
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// 서버 내부 플레이어
+CharaInfo players[MAX_CLIENT];
+
+// 안전 read/write
+ssize_t readn(int fd, void *buf, size_t n) {
+    size_t left = n; char *p = buf;
+    while (left > 0) {
+        ssize_t r = read(fd, p, left);
+        if (r <= 0) return (r == 0 ? n-left : -1);
+        left -= r; p += r;
+    }
+    return n;
+}
+ssize_t writen(int fd, const void *buf, size_t n) {
+    size_t left = n; const char *p = buf;
+    while (left > 0) {
+        ssize_t w = write(fd, p, left);
+        if (w <= 0) return -1;
+        left -= w; p += w;
+    }
+    return n;
+}
+
+// 이동 처리 (단순화)
+void MoveServer(CharaInfo *ch) {
+    if (!ch || ch->stts == CS_Disable) return;
+
+    float vx = 0, vy = 0;
+    if (ch->input.right) vx += MOVE_SPEED;
+    if (ch->input.left)  vx -= MOVE_SPEED;
+    if (ch->input.down)  vy += MOVE_SPEED;
+    if (ch->input.up)    vy -= MOVE_SPEED;
+
+    if (vx && vy) { vx /= sqrtf(2); vy /= sqrtf(2); }
+
+    ch->point.x += vx;
+    ch->point.y += vy;
+
+    // 경계 처리
+    if (ch->point.x < 0) ch->point.x = 0;
+    if (ch->point.y < 0) ch->point.y = 0;
+    if (ch->point.x + ch->rect.w > MAP_Width)
+        ch->point.x = MAP_Width - ch->rect.w;
+    if (ch->point.y + ch->rect.h > MAP_Height)
+        ch->point.y = MAP_Height - ch->rect.h;
+
+    ch->rect.x = (int)ch->point.x;
+    ch->rect.y = (int)ch->point.y;
+}
+
+long long now_ms() {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec/1000;
+}
+
+// 클라이언트 입력 받는 스레드
+void *RecvThread(void *arg) {
+    int id = *(int*)arg; free(arg);
+    int s = csock[id];
+
+    while (1) {
+        Keystts inp;
+        if (readn(s, &inp, sizeof(inp)) <= 0) break;
+        players[id].input = inp;
+    }
+
+    pthread_mutex_lock(&mtx);
+    close(csock[id]);
+    csock[id] = -1;
+    alive[id] = 0;
+    pthread_mutex_unlock(&mtx);
+
+    printf("Client %d disconnected\n", id);
+    return NULL;
+}
+
+// 서버 게임루프 스레드
+void *GameLoop(void *arg) {
+    long long last = now_ms();
+
+    while (1) {
+        long long cur = now_ms();
+        if (cur - last < TICK_MS) {
+            usleep((TICK_MS - (cur-last)) * 1000);
+            continue;
+        }
+        last = cur;
+
+        // 1) 서버 이동
+        for (int i = 0; i < MAX_CLIENT; i++)
+            if (alive[i]) MoveServer(&players[i]);
+
+        // 2) 위치 브로드캐스트
+        NetPos pack[MAX_CLIENT];
+        for (int i = 0; i < MAX_CLIENT; i++) {
+            pack[i].x = players[i].point.x;
+            pack[i].y = players[i].point.y;
+        }
+
+        pthread_mutex_lock(&mtx);
+        for (int i = 0; i < MAX_CLIENT; i++) {
+            if (alive[i] && csock[i] != -1) {
+                if (writen(csock[i], pack, sizeof(pack)) < 0) {
+                    close(csock[i]); csock[i] = -1; alive[i] = 0;
+                }
+            }
+        }
+        pthread_mutex_unlock(&mtx);
+    }
+    return NULL;
+}
+
+int main() {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    bind(s, (struct sockaddr*)&addr, sizeof(addr));
+    listen(s, MAX_CLIENT);
+    printf("Server ready.\n");
+
+    // 기본 플레이어 초기화
+    for (int i=0;i<MAX_CLIENT;i++){
+        csock[i] = -1; alive[i]=0;
+        players[i].point.x = 100 + i*50;
+        players[i].point.y = 200;
+        players[i].rect.w = 32;
+        players[i].rect.h = 48;
+        players[i].stts = CS_Normal;
+        memset(&players[i].input,0,sizeof(players[i].input));
+    }
+
+    // 게임루프 스레드 시작
+    pthread_t gl;
+    pthread_create(&gl, NULL, GameLoop, NULL);
+    pthread_detach(gl);
+
+    // 클라이언트 accept
+    while (1) {
+        int cs = accept(s, NULL, NULL);
+        pthread_mutex_lock(&mtx);
+        int id=-1;
+        for (int i=0;i<MAX_CLIENT;i++) if (!alive[i]) { id=i; break; }
+        if (id<0) { close(cs); pthread_mutex_unlock(&mtx); continue; }
+        csock[id]=cs; alive[id]=1;
+        pthread_mutex_unlock(&mtx);
+
+        printf("Client %d connected\n", id);
+
+        int *pid = malloc(sizeof(int)); *pid=id;
+        pthread_t th;
+        pthread_create(&th,NULL,RecvThread,pid);
+        pthread_detach(th);
+    }
+    return 0;
+}
+
+
+// =============================================================
+// simplified_client.c  (기능 동일, 구조 단순화)
+// =============================================================
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+#include "game.h"
+
+#define PORT 5000
+#define MAX_CLIENT 4
+
+typedef struct { float x,y; } NetPos;
+
+int my_id, sock;
+NetPos latest[MAX_CLIENT];
+pthread_mutex_t pm = PTHREAD_MUTEX_INITIALIZER;
+
+// read/write
+ssize_t readn(int fd, void *buf, size_t n) {
+    size_t left=n; char*p=buf;
+    while(left>0){ ssize_t r=read(fd,p,left); if(r<=0)return(r==0?n-left:-1); left-=r;p+=r;} return n;
+}
+ssize_t writen(int fd,const void*buf,size_t n){size_t l=n;const char*p=buf;while(l>0){ssize_t w=write(fd,p,l);if(w<=0)return-1;l-=w;p+=w;}return n;}
+
+// 서버 수신 스레드
+void *RecvLoop(void *a){
+    while(1){
+        NetPos buf[MAX_CLIENT];
+        if (readn(sock, buf, sizeof(buf)) <= 0) break;
+
+        pthread_mutex_lock(&pm);
+        memcpy(latest, buf, sizeof(buf));
+        pthread_mutex_unlock(&pm);
+    }
+    return NULL;
+}
+
+// 애니메이션 타이머
+Uint32 AnimCB(Uint32 i, void *p){ UpdateAnimation((GameInfo*)p, i/1000.0f); return i; }
+
+int main(int argc,char*argv[]){
+    if(argc<3){ printf("usage: <id> <server-ip>\n"); return 0; }
+    my_id=atoi(argv[1]);
+
+    InitSystem("chara.data","position.data",my_id);
+    InitWindow(&gGames[my_id], "Test", "bg.png", 1280,720);
+
+    for(CharaInfo*ch=gCharaHead;ch;ch=ch->next)
+        if (ch->type>=CT_PLAYER0 && ch->type<CT_PLAYER0+MAX_CLIENT) {
+            int i=ch->type-CT_PLAYER0;
+            latest[i].x=ch->point.x;
+            latest[i].y=ch->point.y;
+        }
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sv={0};
+    sv.sin_family=AF_INET;
+    sv.sin_port=htons(PORT);
+    inet_pton(AF_INET, argv[2], &sv.sin_addr);
+
+    connect(sock,(struct sockaddr*)&sv,sizeof(sv));
+
+    pthread_t th;
+    pthread_create(&th,NULL,RecvLoop,NULL);
+
+    SDL_AddTimer(16,AnimCB,&gGames[my_id]);
+
+    Uint32 last = SDL_GetTicks();
+    SDL_bool run=SDL_TRUE;
+    while(run){
+        Uint32 now=SDL_GetTicks();
+        gGames[my_id].timeDelta=(now-last)/1000.0f;
+        last=now;
+
+        run = InputEvent(&gGames[my_id]);
+
+        // 입력 송신
+        SendInput(&gGames[my_id].input);
+
+        // 서버 보간 적용
+        pthread_mutex_lock(&pm);
+        CharaInfo *ch=gCharaHead;
+        for(int i=0;i<MAX_CLIENT && ch;i++,ch=ch->next){
+            float t=0.2f;
+            ch->point.x += (latest[i].x - ch->point.x)*t;
+            ch->point.y += (latest[i].y - ch->point.y)*t;
+            ch->rect.x=(int)ch->point.x;
+            ch->rect.y=(int)ch->point.y;
+        }
+        pthread_mutex_unlock(&pm);
+
+        DrawGame(&gGames[my_id]);
+        SDL_Delay(8);
+    }
+
+    CloseWindow(&gGames[my_id]);
+    DestroySystem();
+    close(sock);
+    return 0;
+}
