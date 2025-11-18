@@ -1,3 +1,3 @@
 # gamja
 game
-<img width="850" height="566" alt="1759675818" src="https://github.com/user-attachments/assets/789e0302-a6d9-403e-acc3-5bf3875d8cf5" />
+<img width="217" height="213" alt="スクリーンショット 2024-05-15 001607" src="https://github.com/user-attachments/assets/90134bca-c6f4-4079-8964-869bb9f093fb" />
