@@ -1,0 +1,5 @@
+# type   point.x   point.y   rect.x   rect.y   rect.w   rect.h
+0 100 100 0 0 32 64 
+1 200 100 0 0 32 64 
+2 300 100 0 0 32 64 
+3 400 100 0 0 32 64 
